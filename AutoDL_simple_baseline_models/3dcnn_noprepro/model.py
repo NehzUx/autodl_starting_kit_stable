@@ -24,6 +24,7 @@ such as Python modules/packages, pre-trained weights, etc. The final zip file
 should not exceed 300MB.
 """
 
+from sklearn.linear_model import LinearRegression
 import logging
 import numpy as np
 import os
@@ -49,17 +50,13 @@ class Model(object):
     # Get the output dimension, i.e. number of classes
     self.output_dim = self.metadata.get_output_size()
     # Set batch size (for both training and testing)
-    self.batch_size = 30
-
-    # Get model function from class method below
-    model_fn = self.model_fn
-    # Classifier using model_fn
-    self.classifier = tf.estimator.Estimator(model_fn=model_fn)
+    self.batch_size = 1 # necessary when the shape is variable
 
     # Attributes for preprocessing
-    self.default_image_size = (112,112)
-    self.default_num_frames = 10
+    # self.default_image_size = (112,112)
+    # self.default_num_frames = 10
     self.default_shuffle_buffer = 100
+    self.meta_features = {}
 
     # Attributes for managing time budget
     # Cumulated number of training steps
@@ -71,7 +68,7 @@ class Model(object):
     self.cumulated_num_tests = 0
     self.estimated_time_test = None
     # Critical number for early stopping
-    self.num_epochs_we_want_to_train = 1
+    self.num_epochs_we_want_to_train = 40
 
   def train(self, dataset, remaining_time_budget=None):
     """Train this algorithm on the tensorflow |dataset|.
@@ -118,6 +115,16 @@ class Model(object):
     """
     # Get number of steps to train according to some strategy
     steps_to_train = self.get_steps_to_train(remaining_time_budget)
+    if not self.has_fixed_size and not self.meta_features:
+      self.extract_meta_features(dataset)
+
+    if not hasattr(self, 'classifier'):
+      # Get model function from class method below
+      model_fn = self.model_fn
+      # Classifier using model_fn
+      self.classifier = tf.estimator.Estimator(model_fn=model_fn)
+      logger.info("Using temporary folder as model directory: {}"\
+                  .format(self.classifier.model_dir))
 
     # Count examples on training set
     if not hasattr(self, 'num_examples_train'):
@@ -244,26 +251,51 @@ class Model(object):
     hidden_layer = tf.where(tf.is_nan(input_layer),
                            tf.zeros_like(input_layer), input_layer)
 
+    if self.has_fixed_size:
+      sequence_size = self.metadata.get_tensor_shape()[0]
+      row_count = self.metadata.get_tensor_shape()[1]
+      col_count = self.metadata.get_tensor_shape()[2]
+    else:
+      if not self.meta_features:
+        self.extract_meta_features()
+      sequence_size = self.meta_features['mean_sequence_size_train']
+      row_count = self.meta_features['mean_row_count_train']
+      col_count = self.meta_features['mean_col_count_train']
+    # num_3dcnn_layers = get_num_3dcnn_layers(sequence_size,
+    #                                         row_count,
+    #                                         col_count)
+    num_3dcnn_layers = 3
+    logger.info("Constructing a CNN with {} 3D CNN layers..."\
+                .format(num_3dcnn_layers))
+
     # Repeatedly apply 3D CNN, followed by 3D max pooling
-    # until the hidden layer has reasonable number of entries
-    REASONABLE_NUM_ENTRIES = 1000
-    num_filters = 16 # The number of filters is fixed
-    while True:
+    # Double the number of filters after each iteration
+    num_filters = 16
+    for _ in range(num_3dcnn_layers):
       shape = hidden_layer.shape
-      kernel_size = [min(3, shape[1]), min(3, shape[2]), min(3, shape[3])]
+      kernel_size = []
+      pool_size = []
+      for i in range(1, 4):
+        if shape[i] and shape[i] < 3 and shape[i] > 0:
+          kernel_size.append(shape[i])
+        else:
+          kernel_size.append(3)
+        if shape[i] and shape[i] == 1:
+          pool_size.append(shape[i])
+        else:
+          pool_size.append(2)
       hidden_layer = tf.layers.conv3d(inputs=hidden_layer,
                                       filters=num_filters,
-                                      kernel_size=kernel_size)
-      pool_size = [min(2, shape[1]), min(2, shape[2]), min(2, shape[3])]
+                                      kernel_size=kernel_size,
+                                      padding='same')
       hidden_layer= tf.layers.max_pooling3d(inputs=hidden_layer,
                                             pool_size=pool_size,
                                             strides=pool_size,
                                             padding='valid',
                                             data_format='channels_last')
-      if get_num_entries(hidden_layer) < REASONABLE_NUM_ENTRIES:
-        break
+      num_filters *= 2
 
-    hidden_layer = tf.layers.flatten(hidden_layer)
+    hidden_layer = tf.reduce_mean(hidden_layer, axis=[1,2,3])
     hidden_layer = tf.layers.dense(inputs=hidden_layer,
                                    units=64, activation=tf.nn.relu)
     hidden_layer = tf.layers.dropout(
@@ -312,7 +344,7 @@ class Model(object):
     For more information on how to write an input function, see:
       https://www.tensorflow.org/guide/custom_estimators#write_an_input_function
     """
-    dataset = dataset.map(lambda *x: (self.preprocess_tensor_4d(x[0]), x[1]))
+    dataset = dataset.map(lambda *x: (x[0], x[1]))
 
     if is_training:
       # Shuffle input examples
@@ -327,47 +359,36 @@ class Model(object):
     example, labels = iterator.get_next()
     return example, labels
 
-  def preprocess_tensor_4d(self, tensor_4d):
-    """Preprocess a 4-D tensor (only when some dimensions are `None`, i.e.
-    non-fixed). The output tensor wil have fixed, known shape.
+  @property
+  def has_fixed_size(self):
+    tensor_4d_shape = self.metadata.get_tensor_shape()
+    return all([s > 0 for s in tensor_4d_shape])
 
-    Args:
-      tensor_4d: A Tensor of shape
-          [sequence_size, row_count, col_count, num_channels]
-          where some dimensions might be `None`.
-    Returns:
-      A 4-D Tensor with fixed, known shape.
-    """
-    tensor_4d_shape = tensor_4d.shape
-    logger.info("Tensor shape before preprocessing: {}".format(tensor_4d_shape))
-
-    if tensor_4d_shape[0] > 0 and tensor_4d_shape[0] < 10:
-      num_frames = tensor_4d_shape[0]
-    else:
-      num_frames = self.default_num_frames
-    if tensor_4d_shape[1] > 0:
-      new_row_count = tensor_4d_shape[1]
-    else:
-      new_row_count=self.default_image_size[0]
-    if tensor_4d_shape[2] > 0:
-      new_col_count = tensor_4d_shape[2]
-    else:
-      new_col_count=self.default_image_size[1]
-
-    if not tensor_4d_shape[0] > 0:
-      logger.info("Detected that examples have variable sequence_size, will " +
-                "randomly crop a sequence with num_frames = " +
-                "{}".format(num_frames))
-      tensor_4d = crop_time_axis(tensor_4d, num_frames=num_frames)
-    if not tensor_4d_shape[1] > 0 or not tensor_4d_shape[2] > 0:
-      logger.info("Detected that examples have variable space size, will " +
-                "resize space axes to (new_row_count, new_col_count) = " +
-                "{}".format((new_row_count, new_col_count)))
-      tensor_4d = resize_space_axes(tensor_4d,
-                                    new_row_count=new_row_count,
-                                    new_col_count=new_col_count)
-    logger.info("Tensor shape after preprocessing: {}".format(tensor_4d.shape))
-    return tensor_4d
+  def extract_meta_features(self, dataset, subset='train'):
+    logger.info("Begin extracting meta-features...")
+    iterator = dataset.make_one_shot_iterator()
+    example, labels = iterator.get_next()
+    shapes = []
+    sample_count = 0
+    with tf.Session() as sess:
+      while True:
+        try:
+          shape = sess.run(example).shape
+          shapes.append(shape)
+          sample_count += 1
+          if sample_count % 100 == 0:
+            logger.debug("{} samples read...".format(sample_count))
+        except tf.errors.OutOfRangeError:
+          break
+    setattr(self, 'num_examples_{}'.format(subset), sample_count)
+    shapes = np.array(shapes)
+    for idx, dim in enumerate(['sequence_size', 'row_count', 'col_count']):
+      vec = shapes[:, idx]
+      for stat in ['mean', 'max', 'min']:
+        key = '{}_{}_{}'.format(stat, dim, subset)
+        self.meta_features[key] = getattr(np, stat)(vec)
+    logger.info("Finished. Meta-features extracted: {}"\
+                .format(self.meta_features))
 
   def get_steps_to_train(self, remaining_time_budget):
     """Get number of steps for training according to `remaining_time_budget`.
@@ -426,68 +447,48 @@ def sigmoid_cross_entropy_with_logits(labels=None, logits=None):
   element_wise_xent = relu_logits - labels * logits + sigmoid_logits
   return tf.reduce_sum(element_wise_xent)
 
-def get_num_entries(tensor):
-  """Return number of entries for a TensorFlow tensor.
+def get_num_3dcnn_layers(sequence_size, row_count, col_count,
+                         num_neurons=1000, num_filters=16):
+  """Compute the number of 3D CNN layers one needs such that the number of
+  neurons in the hidden layers is (strictly) smaller than `num_neurons`.
 
-  Args:
-    tensor: a tf.Tensor or tf.SparseTensor object of shape
-        (batch_size, sequence_size, row_count, col_count[, num_channels])
-  Returns:
-    num_entries: number of entries of each example, which is equal to
-        sequence_size * row_count * col_count [* num_channels]
+  Each 3D CNN layer is specified by the following code:
+  ```
+  kernel_size = [min(3, sequence_size), min(3, row_count), min(3, col_count)]
+  hidden_layer = tf.layers.conv3d(inputs=hidden_layer,
+                                  filters=num_filters,
+                                  kernel_size=kernel_size,
+                                  padding='same')
+  pool_size = [min(2, sequence_size), min(2, row_count), min(2, col_count)]
+  hidden_layer= tf.layers.max_pooling3d(inputs=hidden_layer,
+                                        pool_size=pool_size,
+                                        strides=pool_size,
+                                        padding='valid',
+                                        data_format='channels_last')
+  ```
   """
-  tensor_shape = tensor.shape
-  assert(len(tensor_shape) > 1)
-  num_entries  = 1
-  for i in tensor_shape[1:]:
-    num_entries *= int(i)
-  return num_entries
-
-def crop_time_axis(tensor_4d, num_frames, begin_index=None):
-  """Given a 4-D tensor, take a slice of length `num_frames` on its time axis.
-
-  Args:
-    tensor_4d: A Tensor of shape
-        [sequence_size, row_count, col_count, num_channels]
-    num_frames: An integer representing the resulted chunk (sequence) length
-    begin_index: The index of the beginning of the chunk. If `None`, chosen
-      randomly.
-  Returns:
-    A Tensor of sequence length `num_frames`, which is a chunk of `tensor_4d`.
-  """
-  # pad sequence if not long enough
-  pad_size = tf.maximum(num_frames - tf.shape(tensor_4d)[0], 0)
-  padded_tensor = tf.pad(tensor_4d, ((0, pad_size), (0, 0), (0, 0), (0, 0)))
-
-  # If not given, randomly choose the beginning index of frames
-  if not begin_index:
-    maxval = tf.shape(padded_tensor)[0] - num_frames + 1
-    begin_index = tf.random.uniform([1],
-                                    minval=0,
-                                    maxval=maxval,
-                                    dtype=tf.int32)
-    begin_index = tf.stack([begin_index[0], 0, 0, 0], name='begin_index')
-
-  sliced_tensor = tf.slice(padded_tensor,
-                           begin=begin_index,
-                           size=[num_frames, -1, -1, -1])
-
-  return sliced_tensor
-
-def resize_space_axes(tensor_4d, new_row_count, new_col_count):
-  """Given a 4-D tensor, resize space axes to have target size.
-
-  Args:
-    tensor_4d: A Tensor of shape
-        [sequence_size, row_count, col_count, num_channels].
-    new_row_count: An integer indicating the target row count.
-    new_col_count: An integer indicating the target column count.
-  Returns:
-    A Tensor of shape [sequence_size, target_row_count, target_col_count].
-  """
-  resized_images = tf.image.resize_images(tensor_4d,
-                                          size=(new_row_count, new_col_count))
-  return resized_images
+  total_expo = np.log2(sequence_size * row_count * col_count * num_filters
+                       / num_neurons)
+  if total_expo < 0:
+    return 0
+  s_expo = int(np.log2(sequence_size))
+  r_expo = int(np.log2(row_count))
+  c_expo = int(np.log2(col_count))
+  expos = sorted([s_expo, r_expo, c_expo])
+  num_3dcnn_layers = 0
+  for i in range(len(expos)):
+    expo = expos[i]
+    if i == 0:
+      prev = 0
+    else:
+      prev = expos[i - 1]
+    if total_expo <= (expo - prev) * (len(expos) - i):
+      num_3dcnn_layers += int(total_expo // (len(expos) - i)) + 1
+      break
+    else:
+      num_3dcnn_layers += expo - prev
+      total_expo -= (expo - prev) * (len(expos) - i)
+  return num_3dcnn_layers
 
 def get_logger(verbosity_level):
   """Set logging format to something like:
